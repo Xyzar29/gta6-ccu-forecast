@@ -9,15 +9,21 @@ How it forecasts
 ----------------
 Every past big launch in the case's comparables is reduced to one curve:
 the log ratio of each release-day hour's viewers to that launch's first
-hour.  Two regressions are fitted per hour on those curves and their
-forecasts are averaged in log space:
+hour.  Four ridge regressions are fitted per hour on those curves and
+their forecasts are averaged in log space with equal weights:
 
 1. a global ridge regression of the log ratio on three features of the
    launch that are known at the checkpoint -- the first hour's level, how
    far the last pre-release hour sits above that first hour, and how the
    week's pre-release mean sits against it;
 2. the same regression re-weighted by a Gaussian kernel on the first
-   hour's level, so launches of a similar size dominate.
+   hour's level, so launches of a similar size dominate;
+3. the global regression with one more per-hour feature: the category's
+   own pre-release diurnal profile at that hour (mean log viewers by UTC
+   hour over the seven days before release, minus the week's mean), which
+   carries the shape of the day -- when the audience is awake and when
+   it sleeps -- and which the first two fits cannot see;
+4. the same diurnal regression kernel-weighted as in (2).
 
 The first hour's level is the dominant signal: launches that start small
 ramp several-fold over the day as regions unlock, launches that start
@@ -32,8 +38,18 @@ marked a weak analogue.  Launches marked early-access contaminated are
 kept: their release-day curves are flat because play began days earlier,
 which is the same direction the scale effect points for a huge launch,
 and they anchor the high first-hour end of the fit where this target
-sits; leaving them in or out changed the practice score by less than
-0.003 either way, and keeping them steadies the per-hour fits.
+sits.
+
+Spread
+------
+Each fit's spread is the interquartile range of its own residuals,
+floored at 0.05 in log space.  On top of that, the late-hour spread is
+shrunk for big launches: big launches' late-day curves are tight (the
+day saturates), while small launches stay wild late into the day, so the
+shrink scales with the target's first-hour level -- zero below a first
+hour of about 36 thousand viewers, full above about 268 thousand, linear
+in log space between the two.  The shrink factor at hour h is
+1 - 0.5 * frac * (h - 2) / 22.
 
 Standard library only, no network, no randomness: the same case always
 produces the same bytes.
@@ -55,6 +71,11 @@ HOURS = range(2, 25)
 SIMULTANEOUS_CUT = 20.0
 KERNEL_BW = 1.0
 RIDGE = 1.0
+
+# Size gate for the late-hour spread shrink, in log first-hour viewers.
+SHRINK_LO = 10.5
+SHRINK_HI = 12.5
+SHRINK_SLOPE = -0.5
 
 
 def parse_time(text):
@@ -124,6 +145,30 @@ def launch_features(hour_one, history_points, day_start):
     )
 
 
+def diurnal_profile(history_points, day_start):
+    """The category's pre-release daily rhythm, per UTC hour.
+
+    For each UTC hour, the mean log viewers over the seven days before
+    the release day, minus the mean over all those hours.  Hours with no
+    reads take 0.0 (the week's mean).  This is the shape of the audience's
+    day: a launch's release-day curve follows it, because viewers watch
+    when they are awake and the regions unlock through the day.
+    """
+    week_ago = day_start - timedelta(days=7)
+    by_hour = {hour: [] for hour in range(24)}
+    for point in history_points:
+        stamp = parse_time(point["from"])
+        if week_ago <= stamp < day_start:
+            by_hour[stamp.hour].append(safe_log(point["viewers"]))
+    all_values = [v for hour in range(24) for v in by_hour[hour]]
+    mean = sum(all_values) / len(all_values) if all_values else 0.0
+    profile = []
+    for hour in range(24):
+        values = by_hour[hour]
+        profile.append(sum(values) / len(values) - mean if values else 0.0)
+    return profile
+
+
 def release_curve(hourly_rows, day_start):
     """Hourly viewers for hours 1..24 of a launch day, None where missing."""
     by_time = {}
@@ -158,15 +203,22 @@ def comparable_pool(case):
         if peak is None or peak / first > SIMULTANEOUS_CUT:
             continue
         feats = launch_features(first, hourly, comp_day)
-        pool.append({"curve": curve, "features": feats})
+        pool.append({
+            "curve": curve,
+            "features": feats,
+            "diurnal": diurnal_profile(hourly, comp_day),
+        })
     return pool
 
 
-def fit_forecast(pool, target_features, hour_one, weighted):
+def fit_forecast(pool, target_features, target_diurnal, hour_one, weighted,
+                 use_diurnal):
     """One forecaster: per-hour ridge regression of log ratios.
 
     weighted: when True, rows are kernel-weighted by closeness of the
     launch's first-hour level to the target's (local-linear fit).
+    use_diurnal: when True, each hour's fit also takes the category's
+    diurnal profile at that hour as a fourth, unstandardised feature.
     Returns {hour: [q05, q25, q50, q75, q95]} in viewer counts.
     """
     target_log_first = target_features[0]
@@ -180,10 +232,13 @@ def fit_forecast(pool, target_features, hour_one, weighted):
         means.append(mean)
         scales.append(math.sqrt(var) or 1.0)
 
-    def design(entry):
-        return [1.0] + [
+    def design(entry, hour):
+        row = [1.0] + [
             (entry["features"][k] - means[k]) / scales[k] for k in range(3)
         ]
+        if use_diurnal:
+            row.append(entry["diurnal"][hour - 1])
+        return row
 
     def weight(entry):
         if not weighted:
@@ -196,14 +251,15 @@ def fit_forecast(pool, target_features, hour_one, weighted):
     ]
     forecast = {}
     for hour in HOURS:
+        target_x = target_row + ([target_diurnal[hour - 1]] if use_diurnal else [])
         rows = []
         for entry in pool:
             value = entry["curve"][hour - 1]
             if value is None:
                 continue
             ratio = safe_log(value) - safe_log(entry["curve"][0])
-            rows.append((design(entry), ratio, weight(entry)))
-        dim = 4
+            rows.append((design(entry, hour), ratio, weight(entry)))
+        dim = len(target_x)
         normal = [[0.0] * dim for _ in range(dim)]
         rhs = [0.0] * dim
         for x, y, w in rows:
@@ -212,7 +268,7 @@ def fit_forecast(pool, target_features, hour_one, weighted):
                 for b in range(dim):
                     normal[a][b] += w * x[a] * x[b]
         beta = solve_linear(normal, rhs, RIDGE)
-        centre = sum(beta[t] * target_row[t] for t in range(dim))
+        centre = sum(beta[t] * target_x[t] for t in range(dim))
         residuals = sorted(
             y - sum(beta[t] * x[t] for t in range(dim)) for x, y, _ in rows
         )
@@ -235,6 +291,18 @@ def house_fallback(hour_one):
     return out
 
 
+def shrink_fraction(hour_one):
+    """How much of the late-hour spread shrink a launch of this size gets.
+
+    Zero for small launches, full for huge ones, linear in log space in
+    between.  Big launches' late-day curves are tight; small launches
+    stay wild, so the shrink must not apply to them.
+    """
+    log_first = safe_log(hour_one)
+    frac = (log_first - SHRINK_LO) / (SHRINK_HI - SHRINK_LO)
+    return min(max(frac, 0.0), 1.0)
+
+
 def forecast_case(case):
     known = case.get("known") or [{}]
     hour_one = max(float(known[0].get("viewers") or 0), 1.0)
@@ -253,20 +321,39 @@ def forecast_case(case):
             for key, v in sorted(buckets.items())
         ]
     target_features = launch_features(hour_one, history, day_start)
+    target_diurnal = diurnal_profile(history, day_start)
     pool = comparable_pool(case)
     if len(pool) < 3:
         combined = house_fallback(hour_one)
     else:
-        global_fit = fit_forecast(pool, target_features, hour_one, weighted=False)
-        local_fit = fit_forecast(pool, target_features, hour_one, weighted=True)
+        fits = [
+            fit_forecast(pool, target_features, target_diurnal, hour_one,
+                         weighted=False, use_diurnal=False),
+            fit_forecast(pool, target_features, target_diurnal, hour_one,
+                         weighted=True, use_diurnal=False),
+            fit_forecast(pool, target_features, target_diurnal, hour_one,
+                         weighted=False, use_diurnal=True),
+            fit_forecast(pool, target_features, target_diurnal, hour_one,
+                         weighted=True, use_diurnal=True),
+        ]
+        frac = shrink_fraction(hour_one)
         combined = {}
         for hour in HOURS:
             quantiles = []
             for k in range(5):
-                log_mean = (
-                    safe_log(global_fit[hour][k]) + safe_log(local_fit[hour][k])
-                ) / 2.0
+                log_mean = sum(
+                    safe_log(fit[hour][k]) for fit in fits
+                ) / len(fits)
                 quantiles.append(math.exp(log_mean))
+            # Shrink the late-hour spread for big launches, around the
+            # median: the median itself does not move.
+            if frac > 0.0:
+                factor = 1.0 + SHRINK_SLOPE * frac * (hour - 2) / 22.0
+                median_log = safe_log(quantiles[2])
+                quantiles = [
+                    math.exp(median_log + (safe_log(q) - median_log) * factor)
+                    for q in quantiles
+                ]
             for k in range(1, 5):
                 quantiles[k] = max(quantiles[k], quantiles[k - 1])
             combined[hour] = quantiles
